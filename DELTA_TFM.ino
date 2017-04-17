@@ -1,13 +1,39 @@
 
 #include "MeAuriga.h"
 
+bool Running = true;
+
+#define NUM_AXIS 3
+#define AXIS_RELATIVE_MODES {false, false, false}
+
+const char axis_codes[NUM_AXIS] = {'X', 'Y', 'Z'};
+float current_position[NUM_AXIS] = { 0.0 };
+static float destination[NUM_AXIS] = { 0.0 };
+bool axis_relative_modes[] = AXIS_RELATIVE_MODES;
+
+static bool relative_mode = false;  // Determina si se usan coordenadas relativas o absolutas
+
 //The ASCII buffer for receiving from the serial:
-#define MAX_CMD_SIZE 96
-#define BUFSIZE 4
+#define MAX_TAM_CMD 96
+#define TAM_BUFFER 4
 
+// Macros para máscara de bits
+#define BIT(b) (1<<(b))
+#define TEST(n,b) (((n)&BIT(b))!=0)
+#define SET_BIT(n,b,value) (n) ^= ((-value)^(n)) & (BIT(b))
 
-extern const char errormagic[] PROGMEM;
-extern const char echomagic[] PROGMEM;
+static char* seen_pointer; ///< un puntero para recorrer los caracteres en la cadena del comando
+
+enum EtiquetasDepuracion {
+  DEBUG_ECHO          = BIT(0),
+  DEBUG_INFO          = BIT(1),
+  DEBUG_ERRORES        = BIT(2),
+  DEBUG_COMUNICACION  = BIT(3)
+};
+uint8_t tfm_debug_flags = DEBUG_INFO | DEBUG_ERRORES;
+
+const char errormagic[] PROGMEM = "Error:";
+const char echomagic[] PROGMEM = "echo:";
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 /////////// cadenas ///////////////////////////////////////////////////////////////////////////////
 #define MSG_ERR_CHECKSUM_MISMATCH           "checksum mismatch, Last Line: "
@@ -16,6 +42,7 @@ extern const char echomagic[] PROGMEM;
 #define MSG_OK                              "ok"
 #define MSG_Enqueueing                      "enqueueing \""
 #define MSG_KILLED                          "PARADA DE EMERG."
+#define MSG_UNKNOWN_COMMAND                 "Unknown command: \""
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 /////////// fin cadenas ///////////////////////////////////////////////////////////////////////////////
 
@@ -23,11 +50,13 @@ extern const char echomagic[] PROGMEM;
 
 static long gcode_N, gcode_LastN, Stopped_gcode_LastN = 0;
 static int commands_in_queue = 0;
-static char command_queue[BUFSIZE][MAX_CMD_SIZE];
+static char command_queue[TAM_BUFFER][MAX_TAM_CMD];
 static int serial_count = 0;
 static char serial_char;
 const char* queued_commands_P = NULL; /* Puntero a la línea actual en la secuencia activa de comandos, o NULL cuando ninguno */
 static int cmd_queue_index_w = 0;
+static int cmd_queue_index_r = 0;
+static char* current_command, *current_command_args;
 
 // pines del los motores paso a paso
 int dirPin1 = mePort[PORT_1].s1;//the direction pin connect to Base Board PORT1 SLOT1
@@ -48,8 +77,6 @@ float posT3Act = -1;
 float posT1Dest = -1;
 float posT2Dest = -1;
 float posT3Dest = -1;
-
-
 
 /// no se para que son
 int result;
@@ -93,7 +120,18 @@ int serialTeller=0;
 
 #define SERIAL_ECHOPAIR(name,value) do{ serial_echopair_P(PSTR(name),(value)); }while(0)
 
+long code_value_long() { return strtol(seen_pointer + 1, NULL, 10); }
 
+int16_t code_value_short() { return (int16_t)strtol(seen_pointer + 1, NULL, 10); }
+
+float code_value() {
+  return strtod(seen_pointer + 1, NULL);;
+}
+
+bool code_seen(char code) {
+  seen_pointer = strchr(current_command_args, code);
+  return (seen_pointer != NULL); // Return TRUE if the code-letter was found
+}
 
 //Cosas que escribir en serie desde la memoria del programa. Ahorra 400 a 2k de RAM.
 inline void serialprintPGM(const char* str) {
@@ -132,7 +170,7 @@ void gcode_line_error(const char* err, bool doFlush = true) {
  * Devuelve false si no agrega ningún comando
  */
 bool enqueuecommand(const char* cmd) {
-  if (*cmd == ';' || commands_in_queue >= BUFSIZE) return false;
+  if (*cmd == ';' || commands_in_queue >= TAM_BUFFER) return false;
 
   // This is dangerous if a mixing of serial and this happens
   char* command = command_queue[cmd_queue_index_w];
@@ -141,7 +179,7 @@ bool enqueuecommand(const char* cmd) {
   SERIAL_ECHOPGM(MSG_Enqueueing);
   SERIAL_ECHO(command);
   SERIAL_ECHOLNPGM("\"");
-  cmd_queue_index_w = (cmd_queue_index_w + 1) % BUFSIZE;
+  cmd_queue_index_w = (cmd_queue_index_w + 1) % TAM_BUFFER;
   commands_in_queue++;
   return true;
 }
@@ -172,6 +210,25 @@ static bool drain_queued_commands_P() {
   return true;
 }
 
+void kill(const char* lcd_msg) {
+  /*
+  cli(); // Stop interrupts
+  disable_all_steppers();
+
+// comprobar si la AURIGA PUEDE...  #if HAS_POWER_SWITCH
+//    pinMode(PS_ON_PIN, INPUT);
+
+
+  SERIAL_ERROR_START;
+  SERIAL_ERRORLNPGM(MSG_ERR_KILLED);
+
+  // FMC small patch to update the LCD before ending
+  sei();   // enable interrupts
+  for (int i = 5; i--; lcd_update()) delay(200); // Wait a short time
+  cli();   // disable interrupts
+  suicide();
+  while (1) { /* Intentionally left empty */ } // Wait for reset*/
+//}
 /**
  * Agrega a la cola de comandos circular el siguiente comando de:
 - La cola de comandos de inyección (queued_commands_P)
@@ -182,12 +239,12 @@ void get_command() {
   //
   // se enbucla mientras entran los caracteres por el puerto serie y la cola no está llena
   //
-  while (commands_in_queue < BUFSIZE && MYSERIAL.available() > 0) {
+  while (commands_in_queue < TAM_BUFFER && MYSERIAL.available() > 0) {
     serial_char = MYSERIAL.read();
     //
     // Si el caracter termina la línea, o la línea está llena ..
     //
-    if (serial_char == '\n' || serial_char == '\r' || serial_count >= MAX_CMD_SIZE - 1) {
+    if (serial_char == '\n' || serial_char == '\r' || serial_count >= MAX_TAM_CMD - 1) {
       if (!serial_count) return; // las lineas vacias se saltan
 
       char* command = command_queue[cmd_queue_index_w];
@@ -198,7 +255,7 @@ void get_command() {
       // si el comando es el de paro, lo procesa ya!
       if (strcmp(command, "M112") == 0) kill(PSTR(MSG_KILLED));
 
-      cmd_queue_index_w = (cmd_queue_index_w + 1) % BUFSIZE;
+      cmd_queue_index_w = (cmd_queue_index_w + 1) % TAM_BUFFER;
       commands_in_queue += 1;
 
       serial_count = 0; // limpia el buffer
@@ -210,9 +267,108 @@ void get_command() {
 }
 
 
+void unknown_command_error() {
+  SERIAL_ECHO_START;
+  SERIAL_ECHOPGM(MSG_UNKNOWN_COMMAND);
+  SERIAL_ECHO(current_command);
+  SERIAL_ECHOPGM("\"\n");
+}
 
 
+/**
+ * Obtiene el destino del comando actual
+ *
+ *  - pone el destino si se especifican las coordenadas
+ *  - deja las actuales para las ausentes
+ */
+void gcode_get_destination() {
+  for (int i = 0; i < NUM_AXIS; i++) {
+    if (code_seen(axis_codes[i]))
+      destination[i] = code_value() + (axis_relative_modes[i] || relative_mode ? current_position[i] : 0);
+    else
+      destination[i] = current_position[i];
+  }
+}
 
+
+/**
+ * Process a single command and dispatch it to its handler
+ * This is called from the main loop()
+ */
+void process_next_command() {
+  current_command = command_queue[cmd_queue_index_r];
+
+  if ((tfm_debug_flags & DEBUG_ECHO)) {
+    SERIAL_ECHO_START;
+    SERIAL_ECHOLN(current_command);
+  }
+
+  // Sanitize the current command:
+  //  - Skip leading spaces
+  //  - Bypass N[-0-9][0-9]*[ ]*
+  //  - Overwrite * with nul to mark the end
+  while (*current_command == ' ') ++current_command;
+  if (*current_command == 'N' && ((current_command[1] >= '0' && current_command[1] <= '9') || current_command[1] == '-')) {
+    current_command += 2; // skip N[-0-9]
+    while (*current_command >= '0' && *current_command <= '9') ++current_command; // skip [0-9]*
+    while (*current_command == ' ') ++current_command; // skip [ ]*
+  }
+  char* starpos = strchr(current_command, '*');  // * should always be the last parameter
+  if (starpos) while (*starpos == ' ' || *starpos == '*') *starpos-- = '\0'; // nullify '*' and ' '
+
+  // Get the command code, which must be G, M, or T
+  char command_code = *current_command;
+
+  // The code must have a numeric value
+  bool code_is_good = (current_command[1] >= '0' && current_command[1] <= '9');
+
+  int codenum; // define ahead of goto
+
+  // Bail early if there's no code
+  if (!code_is_good) goto ExitUnknownCommand;
+
+  // Args pointer optimizes code_seen, especially those taking XYZEF
+  // This wastes a little cpu on commands that expect no arguments.
+  current_command_args = current_command;
+  while (*current_command_args && *current_command_args != ' ') ++current_command_args;
+  while (*current_command_args == ' ') ++current_command_args;
+
+  // Interpret the code int
+  seen_pointer = current_command;
+  codenum = code_value_short();
+
+  // Handle a known G, M, or T
+  switch (command_code) {
+    case 'M': switch (codenum) {
+
+      // G0 -> mover plataforma
+      case 0:
+        _procesa_G0();
+        break;
+    }
+    break;
+
+    default: code_is_good = false;
+  }
+
+ExitUnknownCommand:
+
+  // Still unknown command? Throw an error
+  if (!code_is_good) unknown_command_error();
+
+  ok_to_send();
+}
+
+inline bool IsRunning() { return  Running; }
+
+/**
+ * G0 mueve la plataforma a una posición
+ */
+inline void _procesa_G0() {
+  if (IsRunning()) {
+    gcode_get_destination(); // For X Y Z
+    prepare_move();
+  }
 
 
 
@@ -350,6 +506,12 @@ void stepT3(boolean dir,int steps)
   }
 }
 
+/**
+ * Standard idle routine keeps the machine alive
+ */
+void idle() {
+//  manage_inactivity();
+}
 ///////////////////////////////////////////////////////////////////////////////////////////////
 // inicialización
 ///////////////////////////////////////////////////////////////////////////////////////////////
@@ -369,46 +531,23 @@ void setup()
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////
-// fbucle principal
+// bucle principal
 ///////////////////////////////////////////////////////////////////////////////////////////////
 void loop(){
-  if (commands_in_queue < BUFSIZE - 1) get_command();
+  if (commands_in_queue < TAM_BUFFER - 1) get_command();
 
   if (commands_in_queue) {
 
       process_next_command();
       commands_in_queue--;
-      cmd_queue_index_r = (cmd_queue_index_r + 1) % BUFSIZE;
+      cmd_queue_index_r = (cmd_queue_index_r + 1) % TAM_BUFFER;
   }    
-  checkHitEndstops();
+ // SI EL FINAL DE CARRERA TIENE QUE VER QUE PASA checkHitEndstops();
   idle();
   
   
   
   
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  char xxPos[4];  // x position taken from processing
-  char yyPos[4];  // y position taken from processing
-  char zzPos[4];  // z position taken from processing
-  char tempo;     // temp variable
 
   if (Serial.available() > 12) {
     tempo=Serial.read();  //read from serial
